@@ -1,0 +1,36 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Streamlitgit commit -m "Optimize mutual fund scraper"
+.streamlit/secrets.toml
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Generated Excel files
+*.xlsx
+*.xls
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Temporary files
+*.tmp
+*.temp
