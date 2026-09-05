@@ -211,26 +211,16 @@ def has_all_returns(data: Dict[str, Optional[float]]) -> bool:
 # ============================================================
 
 async def create_browser(playwright):
-    """
-    Streamlit Cloud friendly Chromium configuration.
-    """
 
     browser = await playwright.chromium.launch(
-        headless=HEADLESS,
+        headless=True,
         args=[
+            "--headless=new",
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--disable-notifications",
-            "--disable-popup-blocking",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-            "--disable-features=Translate,BackForwardCache",
+            "--disable-blink-features=AutomationControlled",
             "--window-size=1440,900",
         ],
     )
