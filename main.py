@@ -1,10 +1,15 @@
 import asyncio
+import os
 import re
+import shutil
+import subprocess
+import sys
 from typing import Dict, List, Optional
 
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+
 from playwright.async_api import (
     async_playwright,
     TimeoutError as PlaywrightTimeoutError,
@@ -18,18 +23,17 @@ from playwright.async_api import (
 OUTPUT_FILE = "mutual_funds.xlsx"
 
 # IMPORTANT:
-# Keep True for Streamlit Cloud.
-HEADLESS = True
+# We deliberately use headed Chromium through Xvfb.
+# This behaves much closer to the working local version.
+HEADLESS = False
 
-# 3 is a good balance for Moneycontrol.
-# Increase to 4 only after confirming stability.
+# Moneycontrol + Streamlit Cloud
 MAX_CONCURRENCY = 3
 
 PAGE_TIMEOUT = 60000
-PERFORMANCE_TIMEOUT = 25000
+DATA_TIMEOUT = 30000
 ELEMENT_TIMEOUT = 15000
 
-# Number of attempts for an individual fund.
 MAX_RETRIES = 2
 
 
@@ -129,30 +133,119 @@ FUNDS = {
 
 
 # ============================================================
+# Xvfb
+# ============================================================
+
+_XVFB_PROCESS = None
+
+
+def start_virtual_display():
+    """
+    Start Xvfb when running on Linux/Streamlit Cloud.
+
+    This allows Playwright to run in headed mode without
+    a physical display.
+    """
+
+    global _XVFB_PROCESS
+
+    # Windows/macOS local machine already has a display.
+    if os.name != "posix":
+        return
+
+    # If DISPLAY already exists, don't start another one.
+    if os.environ.get("DISPLAY"):
+        return
+
+    xvfb = shutil.which("Xvfb")
+
+    if not xvfb:
+        print(
+            "WARNING: Xvfb not found. "
+            "Playwright headed mode may fail."
+        )
+        return
+
+    display = ":99"
+
+    try:
+
+        _XVFB_PROCESS = subprocess.Popen(
+            [
+                xvfb,
+                display,
+                "-screen",
+                "0",
+                "1440x900x24",
+                "-ac",
+                "-nolisten",
+                "tcp",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        os.environ["DISPLAY"] = display
+
+        # Give X server a moment to start.
+        import time
+        time.sleep(1)
+
+        print(
+            f"Xvfb started on DISPLAY={display}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"WARNING: Could not start Xvfb: {e}"
+        )
+
+
+# Start display as soon as this module loads.
+start_virtual_display()
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
+PERIODS = (
+    "1Y",
+    "2Y",
+    "3Y",
+    "5Y",
+)
+
+
 def clean_text(value) -> str:
+
+    if value is None:
+        return ""
+
     return re.sub(
         r"\s+",
         " ",
-        str(value or "").replace("\xa0", " ")
+        str(value)
+        .replace("\xa0", " ")
     ).strip()
 
 
 def parse_number(value) -> Optional[float]:
+
     value = clean_text(value)
 
     if not value:
         return None
 
-    if value in {
+    if value.lower() in {
         "--",
         "-",
-        "N/A",
-        "NA",
-        "Nil",
+        "n/a",
+        "na",
+        "nil",
         "n.a.",
+        "none",
     }:
         return None
 
@@ -165,14 +258,19 @@ def parse_number(value) -> Optional[float]:
         return None
 
     try:
+
         return float(
-            match.group(0).replace(",", "")
+            match.group(0)
+            .replace(",", "")
         )
+
     except Exception:
+
         return None
 
 
 def empty_returns() -> Dict[str, Optional[float]]:
+
     return {
         "1Y": None,
         "2Y": None,
@@ -182,28 +280,122 @@ def empty_returns() -> Dict[str, Optional[float]]:
 
 
 def period_key(value) -> Optional[str]:
-    value = clean_text(value).lower()
 
-    if re.search(r"\b1\s*year\b", value):
+    text = clean_text(
+        value
+    ).lower()
+
+    if re.search(
+        r"\b1\s*(?:year|years|yr|yrs|y)\b",
+        text
+    ):
         return "1Y"
 
-    if re.search(r"\b2\s*years?\b", value):
+    if re.search(
+        r"\b2\s*(?:year|years|yr|yrs|y)\b",
+        text
+    ):
         return "2Y"
 
-    if re.search(r"\b3\s*years?\b", value):
+    if re.search(
+        r"\b3\s*(?:year|years|yr|yrs|y)\b",
+        text
+    ):
         return "3Y"
 
-    if re.search(r"\b5\s*years?\b", value):
+    if re.search(
+        r"\b5\s*(?:year|years|yr|yrs|y)\b",
+        text
+    ):
         return "5Y"
 
     return None
 
 
-def has_all_returns(data: Dict[str, Optional[float]]) -> bool:
+def has_any_returns(data):
+
+    return any(
+        data.get(key) is not None
+        for key in PERIODS
+    )
+
+
+def has_all_returns(data):
+
     return all(
         data.get(key) is not None
-        for key in ("1Y", "2Y", "3Y", "5Y")
+        for key in PERIODS
     )
+
+
+# ============================================================
+# PLAYWRIGHT BROWSER INSTALL
+# ============================================================
+
+_BROWSER_READY = False
+
+
+def ensure_playwright_browser():
+
+    global _BROWSER_READY
+
+    if _BROWSER_READY:
+        return
+
+    # Playwright's expected Chromium path.
+    try:
+
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+
+            browser_path = p.chromium.executable_path
+
+        if os.path.exists(browser_path):
+
+            print(
+                "Playwright Chromium already installed."
+            )
+
+            _BROWSER_READY = True
+            return
+
+    except Exception:
+        pass
+
+    print(
+        "Playwright Chromium not found."
+    )
+
+    print(
+        "Installing Chromium..."
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "playwright",
+            "install",
+            "chromium",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=300,
+    )
+
+    print(
+        result.stdout
+    )
+
+    if result.returncode != 0:
+
+        raise RuntimeError(
+            "Could not install Playwright Chromium."
+        )
+
+    _BROWSER_READY = True
 
 
 # ============================================================
@@ -211,30 +403,37 @@ def has_all_returns(data: Dict[str, Optional[float]]) -> bool:
 # ============================================================
 
 async def create_browser(playwright):
-    """
-    Launch Debian's system Chromium headless shell.
-    This is used on Streamlit Community Cloud.
-    """
 
     browser = await playwright.chromium.launch(
-        headless=True,
-        executable_path="/usr/bin/chromium-headless-shell",
+
+        # IMPORTANT:
+        # Headed mode is intentional.
+        # Xvfb provides the virtual display on Cloud.
+        headless=False,
+
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
+
             "--disable-gpu",
             "--disable-software-rasterizer",
+
             "--disable-extensions",
+
             "--disable-background-networking",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
-            "--disable-features=Translate,BackForwardCache",
-            "--no-first-run",
-            "--no-default-browser-check",
+
             "--disable-notifications",
             "--disable-popup-blocking",
+
+            "--no-first-run",
+            "--no-default-browser-check",
+
             "--window-size=1440,900",
+
+            "--disable-blink-features=AutomationControlled",
         ],
     )
 
@@ -244,6 +443,7 @@ async def create_browser(playwright):
 async def create_context(browser):
 
     context = await browser.new_context(
+
         viewport={
             "width": 1440,
             "height": 900,
@@ -259,18 +459,23 @@ async def create_context(browser):
         timezone_id="Asia/Kolkata",
 
         user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
             "(KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
+            "Chrome/131.0.0.0 "
+            "Safari/537.36"
         ),
 
         extra_http_headers={
-            "Accept-Language": "en-IN,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
+            "Accept-Language":
+                "en-IN,en;q=0.9",
+
+            "Upgrade-Insecure-Requests":
+                "1",
         },
 
-        service_workers="block",
+        ignore_https_errors=False,
     )
 
     return context
@@ -282,49 +487,42 @@ async def create_context(browser):
 
 async def prepare_page(page):
 
-    # Don't block images/fonts here.
-    # Moneycontrol can behave differently if these are blocked.
+    # DO NOT block Moneycontrol resources.
     #
-    # We only abort obvious tracking/advertising requests.
-    async def route_handler(route):
+    # The previous implementation blocked resources and
+    # could interfere with the site's dynamic frontend.
 
-        request = route.request
-        url = request.url.lower()
-
-        # Keep the main site resources.
-        # Avoid aggressively blocking because the site is dynamic.
-        if any(
-            x in url
-            for x in [
-                "doubleclick.net",
-                "googlesyndication.com",
-                "googleadservices.com",
-                "facebook.com/tr",
-            ]
-        ):
-            try:
-                await route.abort()
-            except Exception:
-                pass
-            return
+    async def dismiss_dialog(dialog):
 
         try:
-            await route.continue_()
+            await dialog.dismiss()
         except Exception:
             pass
 
-    await page.route(
-        "**/*",
-        route_handler
-    )
-
-    # Prevent dialogs from stopping the scraper.
     page.on(
         "dialog",
         lambda dialog: asyncio.create_task(
-            dialog.dismiss()
+            dismiss_dialog(dialog)
         )
     )
+
+    # Remove webdriver flag.
+    try:
+
+        await page.add_init_script(
+            """
+            Object.defineProperty(
+                navigator,
+                'webdriver',
+                {
+                    get: () => undefined
+                }
+            );
+            """
+        )
+
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -333,6 +531,10 @@ async def prepare_page(page):
 
 async def load_fund_page(page, url):
 
+    print(
+        f"Opening: {url}"
+    )
+
     response = await page.goto(
         url,
         wait_until="domcontentloaded",
@@ -340,31 +542,97 @@ async def load_fund_page(page, url):
     )
 
     if response:
-        status = response.status
 
         print(
-            f"HTTP {status}: {url}"
+            f"HTTP {response.status}: {url}"
         )
 
-        if status >= 400:
+        if response.status >= 400:
+
             raise RuntimeError(
-                f"HTTP {status}"
+                f"HTTP {response.status}"
             )
 
-    # Let Moneycontrol's JS render.
-    await page.wait_for_timeout(1800)
+    # Moneycontrol frontend rendering.
+    await page.wait_for_timeout(
+        2500
+    )
 
-    # DOM may continue loading after domcontentloaded.
     try:
+
         await page.wait_for_load_state(
             "networkidle",
-            timeout=8000,
+            timeout=10000
         )
+
     except PlaywrightTimeoutError:
-        # Networkidle isn't required.
         pass
 
-    await page.wait_for_timeout(700)
+    await page.wait_for_timeout(
+        1500
+    )
+
+
+# ============================================================
+# PERFORMANCE TAB
+# ============================================================
+
+async def activate_performance(page):
+
+    candidates = [
+
+        page.get_by_role(
+            "button",
+            name=re.compile(
+                r"^Performance$",
+                re.I
+            )
+        ).first,
+
+        page.get_by_text(
+            "Performance",
+            exact=True
+        ).first,
+
+        page.locator(
+            "#performance"
+        ).first,
+    ]
+
+    for candidate in candidates:
+
+        try:
+
+            if await candidate.count() == 0:
+                continue
+
+            if await candidate.is_visible():
+
+                await candidate.scroll_into_view_if_needed(
+                    timeout=3000
+                )
+
+                try:
+
+                    await candidate.click(
+                        timeout=5000
+                    )
+
+                except Exception:
+
+                    await candidate.click(
+                        timeout=5000,
+                        force=True
+                    )
+
+                await page.wait_for_timeout(
+                    1000
+                )
+
+                return
+
+        except Exception:
+            continue
 
 
 # ============================================================
@@ -373,75 +641,47 @@ async def load_fund_page(page, url):
 
 async def extract_aum(page):
 
-    selectors = [
-        '//*[@id="overview"]/div[1]/ul/li[1]',
+    try:
 
-        "#overview",
-
-        'text=/AUM\\s*\\(Crs?\\.?\\)/i',
-    ]
-
-    for selector in selectors:
-
-        try:
-
-            if selector.startswith("text="):
-                locator = page.get_by_text(
-                    re.compile(
-                        r"AUM\s*\(Crs?\.?\)",
-                        re.I
-                    )
-                ).first
-            elif selector.startswith("//"):
-                locator = page.locator(
-                    f"xpath={selector}"
-                ).first
-            else:
-                locator = page.locator(
-                    selector
-                ).first
-
-            if await locator.count() == 0:
-                continue
-
-            await locator.wait_for(
-                state="attached",
-                timeout=ELEMENT_TIMEOUT
+        body = clean_text(
+            await page.locator(
+                "body"
+            ).inner_text(
+                timeout=5000
             )
+        )
 
-            text = clean_text(
-                await locator.inner_text(
-                    timeout=5000
-                )
-            )
+        patterns = [
 
-            # Example:
-            # AUM (Crs.) 12,345.67
+            r"AUM\s*\(Crs?\.?\)\s*"
+            r"([\d,]+(?:\.\d+)?)",
+
+            r"AUM\s*\(Cr\.?\)\s*"
+            r"([\d,]+(?:\.\d+)?)",
+
+            r"\bAUM\s+"
+            r"([\d,]+(?:\.\d+)?)",
+        ]
+
+        for pattern in patterns:
+
             match = re.search(
-                r"AUM\s*\(Crs?\.?\)\s*"
-                r"([\d,]+(?:\.\d+)?)",
-                text,
+                pattern,
+                body,
                 re.I
             )
 
             if match:
-                return parse_number(
+
+                value = parse_number(
                     match.group(1)
                 )
 
-            # Fallback
-            numbers = re.findall(
-                r"\d[\d,]*(?:\.\d+)?",
-                text
-            )
+                if value is not None:
+                    return value
 
-            if numbers:
-                return parse_number(
-                    numbers[-1]
-                )
-
-        except Exception:
-            continue
+    except Exception:
+        pass
 
     return None
 
@@ -460,7 +700,7 @@ async def get_performance_section(page):
 
         await performance.wait_for(
             state="attached",
-            timeout=PERFORMANCE_TIMEOUT
+            timeout=DATA_TIMEOUT
         )
 
         await performance.scroll_into_view_if_needed(
@@ -469,18 +709,14 @@ async def get_performance_section(page):
 
         return performance
 
-    except Exception as e:
+    except Exception:
+        pass
 
-        print(
-            "Performance section error:",
-            e
-        )
-
-        return None
+    return None
 
 
 # ============================================================
-# SIP BUTTON
+# SIP CLICK
 # ============================================================
 
 async def click_sip(page):
@@ -491,13 +727,19 @@ async def click_sip(page):
 
     candidates = [
 
-        # Text
         performance.get_by_text(
             "SIP",
             exact=True
         ).first,
 
-        # Label
+        performance.get_by_role(
+            "radio",
+            name=re.compile(
+                r"^SIP$",
+                re.I
+            )
+        ).first,
+
         performance.locator(
             "label"
         ).filter(
@@ -507,22 +749,10 @@ async def click_sip(page):
             )
         ).first,
 
-        # Radio
         performance.locator(
             'input[type="radio"]'
         ).nth(1),
 
-        # Button
-        performance.locator(
-            "button"
-        ).filter(
-            has_text=re.compile(
-                r"^\s*SIP\s*$",
-                re.I
-            )
-        ).first,
-
-        # Generic element
         page.get_by_text(
             "SIP",
             exact=True
@@ -543,7 +773,6 @@ async def click_sip(page):
                 timeout=3000
             )
 
-            # Click with force only if normal click fails.
             try:
 
                 await candidate.click(
@@ -557,9 +786,9 @@ async def click_sip(page):
                     force=True
                 )
 
-            # Give JS time to switch table.
+            # Wait for Moneycontrol JS.
             await page.wait_for_timeout(
-                1000
+                2000
             )
 
             return True
@@ -571,18 +800,20 @@ async def click_sip(page):
 
 
 # ============================================================
-# TABLE EXTRACTION
+# TABLE READER
 # ============================================================
 
-async def read_table_rows(table):
+async def read_table(table):
 
-    rows = table.locator("tr")
+    rows = table.locator(
+        "tr"
+    )
 
-    row_count = await rows.count()
+    count = await rows.count()
 
-    all_rows = []
+    result = []
 
-    for i in range(row_count):
+    for i in range(count):
 
         cells = rows.nth(i).locator(
             "th, td"
@@ -593,13 +824,13 @@ async def read_table_rows(table):
         if cell_count == 0:
             continue
 
-        values = []
+        row = []
 
         for j in range(cell_count):
 
             try:
 
-                text = clean_text(
+                value = clean_text(
                     await cells.nth(j).inner_text(
                         timeout=1500
                     )
@@ -607,23 +838,24 @@ async def read_table_rows(table):
 
             except Exception:
 
-                text = ""
+                value = ""
 
-            values.append(text)
+            row.append(value)
 
-        if values:
-            all_rows.append(values)
+        if row:
+            result.append(row)
 
-    return all_rows
+    return result
 
+
+# ============================================================
+# TABLE PARSER
+# ============================================================
 
 def find_annualised_column(rows):
 
-    if not rows:
-        return None
-
-    # Search first 3 rows because headers can span rows.
-    for row in rows[:3]:
+    # Search first 5 rows.
+    for row in rows[:5]:
 
         for index, value in enumerate(row):
 
@@ -642,22 +874,21 @@ def find_annualised_column(rows):
 
 async def parse_table(table, mode):
 
-    rows = await read_table_rows(
+    rows = await read_table(
         table
     )
 
+    result = empty_returns()
+
     if not rows:
-        return empty_returns()
+        return result
 
     annualised_index = find_annualised_column(
         rows
     )
 
-    result = empty_returns()
-
     # --------------------------------------------------------
-    # Preferred method:
-    # Find Annualised column from header.
+    # Header based extraction
     # --------------------------------------------------------
 
     if annualised_index is not None:
@@ -674,180 +905,216 @@ async def parse_table(table, mode):
             if not key:
                 continue
 
-            if annualised_index < len(row):
+            if annualised_index >= len(row):
+                continue
+
+            value = parse_number(
+                row[annualised_index]
+            )
+
+            if value is not None:
+
+                result[key] = value
+
+    # --------------------------------------------------------
+    # Known Moneycontrol structure fallback
+    # --------------------------------------------------------
+
+    for row in rows:
+
+        if not row:
+            continue
+
+        key = period_key(
+            row[0]
+        )
+
+        if not key:
+            continue
+
+        if result[key] is not None:
+            continue
+
+        if mode == "Lumpsum":
+
+            # Period | Absolute | Annualised
+            if len(row) >= 3:
 
                 value = parse_number(
-                    row[annualised_index]
+                    row[2]
                 )
 
                 if value is not None:
                     result[key] = value
 
-    # --------------------------------------------------------
-    # Fallback based on known Moneycontrol structures.
-    # --------------------------------------------------------
+        else:
 
-    if not has_all_returns(result):
-
-        for row in rows:
-
-            if not row:
-                continue
-
-            key = period_key(
-                row[0]
-            )
-
-            if not key:
-                continue
-
-            # Lumpsum:
-            # Period | Absolute | Annualised
-            if mode == "Lumpsum":
-
-                if len(row) >= 3:
-
-                    value = parse_number(
-                        row[2]
-                    )
-
-                    if value is not None:
-                        result[key] = value
-
-            # SIP:
             # Period | Start | Invested | Latest |
             # Absolute | Annualised
-            else:
 
-                if len(row) >= 2:
+            if len(row) >= 2:
 
-                    value = parse_number(
-                        row[-1]
-                    )
+                value = parse_number(
+                    row[-1]
+                )
 
-                    if value is not None:
-                        result[key] = value
+                if value is not None:
+                    result[key] = value
 
     return result
 
 
 # ============================================================
-# PERFORMANCE EXTRACTION
+# TEXT PARSER
 # ============================================================
 
-async def extract_lumpsum(page, performance):
+def parse_returns_from_text(
+    text,
+    mode
+):
+
+    text = clean_text(
+        text
+    )
 
     result = empty_returns()
 
-    # Find every table in performance section.
-    tables = performance.locator(
-        "table"
+    if not text:
+        return result
+
+    text = re.sub(
+        r"Annualized",
+        "Annualised",
+        text,
+        flags=re.I
     )
 
-    count = await tables.count()
+    period_pattern = (
+        r"(1\s*(?:Year|Years|Y|Yr|Yrs)|"
+        r"2\s*(?:Year|Years|Y|Yr|Yrs)|"
+        r"3\s*(?:Year|Years|Y|Yr|Yrs)|"
+        r"5\s*(?:Year|Years|Y|Yr|Yrs))"
+    )
 
-    for i in range(count):
+    matches = list(
+        re.finditer(
+            period_pattern,
+            text,
+            re.I
+        )
+    )
 
-        try:
+    for index, match in enumerate(matches):
 
-            parsed = await parse_table(
-                tables.nth(i),
-                "Lumpsum"
-            )
+        key = period_key(
+            match.group(1)
+        )
 
-            for key in result:
-
-                if parsed[key] is not None:
-                    result[key] = parsed[key]
-
-            if has_all_returns(result):
-                return result
-
-        except Exception:
+        if not key:
             continue
 
-    # --------------------------------------------------------
-    # Text fallback
-    # --------------------------------------------------------
+        start = match.end()
+
+        if index + 1 < len(matches):
+
+            end = matches[
+                index + 1
+            ].start()
+
+        else:
+
+            end = min(
+                len(text),
+                start + 300
+            )
+
+        section = text[
+            start:end
+        ]
+
+        numbers = re.findall(
+            r"-?\d[\d,]*(?:\.\d+)?%?",
+            section
+        )
+
+        values = []
+
+        for item in numbers:
+
+            value = parse_number(
+                item
+            )
+
+            if value is not None:
+
+                values.append(
+                    value
+                )
+
+        if values:
+
+            # Annualised is the last return value
+            # in the Moneycontrol return row.
+            result[key] = values[-1]
+
+    return result
+
+
+# ============================================================
+# PERFORMANCE TEXT
+# ============================================================
+
+async def performance_text(
+    page,
+    performance
+):
 
     try:
 
-        text = clean_text(
-            await performance.inner_text(
-                timeout=5000
-            )
+        text = await performance.inner_text(
+            timeout=5000
         )
 
-        patterns = {
-
-            "1Y": (
-                r"1\s*Year\s+"
-                r"(-?[\d,]+(?:\.\d+)?|--)\s+"
-                r"(-?[\d,]+(?:\.\d+)?|--)"
-            ),
-
-            "2Y": (
-                r"2\s*Years?\s+"
-                r"(-?[\d,]+(?:\.\d+)?|--)\s+"
-                r"(-?[\d,]+(?:\.\d+)?|--)"
-            ),
-
-            "3Y": (
-                r"3\s*Years?\s+"
-                r"(-?[\d,]+(?:\.\d+)?|--)\s+"
-                r"(-?[\d,]+(?:\.\d+)?|--)"
-            ),
-
-            "5Y": (
-                r"5\s*Years?\s+"
-                r"(-?[\d,]+(?:\.\d+)?|--)\s+"
-                r"(-?[\d,]+(?:\.\d+)?|--)"
-            ),
-        }
-
-        for key, pattern in patterns.items():
-
-            if result[key] is not None:
-                continue
-
-            match = re.search(
-                pattern,
-                text,
-                re.I
-            )
-
-            if match:
-
-                result[key] = parse_number(
-                    match.group(2)
-                )
+        return clean_text(
+            text
+        )
 
     except Exception:
         pass
 
-    return result
+    try:
+
+        text = await page.locator(
+            "body"
+        ).inner_text(
+            timeout=5000
+        )
+
+        return clean_text(
+            text
+        )
+
+    except Exception:
+
+        return ""
 
 
-async def extract_sip(page, performance):
+# ============================================================
+# LUMPSUM
+# ============================================================
+
+async def extract_lumpsum(
+    page,
+    performance
+):
 
     result = empty_returns()
 
-    clicked = await click_sip(
+    await activate_performance(
         page
     )
 
-    if not clicked:
-
-        print(
-            "SIP button not found"
-        )
-
-        return result
-
-    # --------------------------------------------------------
-    # Wait until SIP content appears.
-    # --------------------------------------------------------
-
+    # Wait for annualised content.
     try:
 
         await page.wait_for_function(
@@ -856,31 +1123,30 @@ async def extract_sip(page, performance):
                 const el =
                     document.querySelector("#performance");
 
-                if (!el) {
-                    return false;
-                }
+                if (!el) return false;
 
                 const text =
                     el.innerText || "";
 
                 return (
-                    text.includes("Invested") ||
-                    text.includes("SIP Returns")
+                    text.includes("Annualised") ||
+                    text.includes("Annualized") ||
+                    text.includes("1 Year")
                 );
             }
             """,
-            timeout=12000
+            timeout=DATA_TIMEOUT
         )
 
     except Exception:
         pass
 
     await page.wait_for_timeout(
-        800
+        1000
     )
 
     # --------------------------------------------------------
-    # Parse SIP tables.
+    # Parse tables
     # --------------------------------------------------------
 
     tables = performance.locator(
@@ -899,10 +1165,142 @@ async def extract_sip(page, performance):
                 )
             )
 
-            # Prefer SIP table.
+            if not table_text:
+                continue
+
+            if (
+                "Annualised" not in table_text
+                and "Annualized" not in table_text
+                and "1 Year" not in table_text
+            ):
+                continue
+
+            parsed = await parse_table(
+                tables.nth(i),
+                "Lumpsum"
+            )
+
+            for key in PERIODS:
+
+                if parsed[key] is not None:
+
+                    result[key] = (
+                        parsed[key]
+                    )
+
+            if has_all_returns(result):
+
+                return result
+
+        except Exception:
+            continue
+
+    # --------------------------------------------------------
+    # Text fallback
+    # --------------------------------------------------------
+
+    text = await performance_text(
+        page,
+        performance
+    )
+
+    parsed = parse_returns_from_text(
+        text,
+        "Lumpsum"
+    )
+
+    for key in PERIODS:
+
+        if result[key] is None:
+
+            result[key] = parsed[key]
+
+    return result
+
+
+# ============================================================
+# SIP
+# ============================================================
+
+async def extract_sip(
+    page,
+    performance
+):
+
+    result = empty_returns()
+
+    clicked = await click_sip(
+        page
+    )
+
+    if not clicked:
+
+        print(
+            "WARNING: SIP button not found"
+        )
+
+        return result
+
+    # Wait for SIP data.
+    try:
+
+        await page.wait_for_function(
+            """
+            () => {
+                const el =
+                    document.querySelector("#performance");
+
+                if (!el) return false;
+
+                const text =
+                    el.innerText || "";
+
+                return (
+                    text.includes("Invested") ||
+                    text.includes("SIP Returns") ||
+                    text.includes("Annualised") ||
+                    text.includes("Annualized")
+                );
+            }
+            """,
+            timeout=DATA_TIMEOUT
+        )
+
+    except Exception:
+        pass
+
+    await page.wait_for_timeout(
+        1200
+    )
+
+    # --------------------------------------------------------
+    # Tables
+    # --------------------------------------------------------
+
+    tables = performance.locator(
+        "table"
+    )
+
+    count = await tables.count()
+
+    for i in range(count):
+
+        try:
+
+            table_text = clean_text(
+                await tables.nth(i).inner_text(
+                    timeout=3000
+                )
+            )
+
+            if not table_text:
+                continue
+
             if (
                 "Invested" not in table_text
+                and "SIP Returns" not in table_text
                 and "Annualised" not in table_text
+                and "Annualized" not in table_text
             ):
                 continue
 
@@ -911,68 +1309,40 @@ async def extract_sip(page, performance):
                 "SIP"
             )
 
-            for key in result:
+            for key in PERIODS:
 
                 if parsed[key] is not None:
-                    result[key] = parsed[key]
+
+                    result[key] = (
+                        parsed[key]
+                    )
 
             if has_all_returns(result):
+
                 return result
 
         except Exception:
             continue
 
     # --------------------------------------------------------
-    # SIP text fallback
+    # Text fallback
     # --------------------------------------------------------
 
-    try:
+    text = await performance_text(
+        page,
+        performance
+    )
 
-        text = clean_text(
-            await performance.inner_text(
-                timeout=5000
-            )
-        )
+    parsed = parse_returns_from_text(
+        text,
+        "SIP"
+    )
 
-        # Match each period and take the last numeric
-        # value before the next period.
-        for key, period_pattern in {
-            "1Y": r"1\s*Year",
-            "2Y": r"2\s*Years?",
-            "3Y": r"3\s*Years?",
-            "5Y": r"5\s*Years?",
-        }.items():
+    for key in PERIODS:
 
-            if result[key] is not None:
-                continue
+        if result[key] is None:
 
-            match = re.search(
-                period_pattern +
-                r"(.*?)(?="
-                r"\d\s*Years?"
-                r"|$)",
-                text,
-                re.I
-            )
-
-            if not match:
-                continue
-
-            section = match.group(1)
-
-            numbers = re.findall(
-                r"-?\d[\d,]*(?:\.\d+)?",
-                section
-            )
-
-            if numbers:
-
-                result[key] = parse_number(
-                    numbers[-1]
-                )
-
-    except Exception:
-        pass
+            result[key] = parsed[key]
 
     return result
 
@@ -1034,7 +1404,7 @@ async def scrape_one(
                 if performance is None:
 
                     raise RuntimeError(
-                        "Performance section not loaded"
+                        "Performance section not found"
                     )
 
                 if mode == "SIP":
@@ -1053,15 +1423,21 @@ async def scrape_one(
 
                 print(
                     f"RESULT | {mode} | {name} | "
-                    f"AUM={aum} | {returns}"
+                    f"AUM={aum} | "
+                    f"1Y={returns['1Y']} | "
+                    f"2Y={returns['2Y']} | "
+                    f"3Y={returns['3Y']} | "
+                    f"5Y={returns['5Y']}"
                 )
 
-                # If nothing was obtained, retry.
+                # ------------------------------------------------
+                # Success condition
+                # ------------------------------------------------
+
                 if (
                     aum is None
-                    and not any(
-                        value is not None
-                        for value in returns.values()
+                    and not has_any_returns(
+                        returns
                     )
                 ):
 
@@ -1071,26 +1447,36 @@ async def scrape_one(
 
                 return {
                     "Fund": name,
+
                     "AUM (₹ Cr.)": aum,
-                    "1Y (%)": returns["1Y"],
-                    "2Y (%)": returns["2Y"],
-                    "3Y (%)": returns["3Y"],
-                    "5Y (%)": returns["5Y"],
+
+                    "1Y (%)":
+                        returns["1Y"],
+
+                    "2Y (%)":
+                        returns["2Y"],
+
+                    "3Y (%)":
+                        returns["3Y"],
+
+                    "5Y (%)":
+                        returns["5Y"],
+
                     "Source": url,
                 }
 
             except Exception as e:
 
                 print(
-                    f"ERROR | {mode} | {name} | "
+                    f"ERROR | {mode} | "
+                    f"{name} | "
                     f"attempt={attempt}: {e}"
                 )
 
                 if attempt < MAX_RETRIES:
 
-                    # Small retry delay.
                     await asyncio.sleep(
-                        1.0 * attempt
+                        2 * attempt
                     )
 
             finally:
@@ -1116,7 +1502,7 @@ async def scrape_one(
 
 
 # ============================================================
-# MAIN ASYNC SCRAPER
+# ASYNC SCRAPER
 # ============================================================
 
 async def _scrape(
@@ -1146,6 +1532,12 @@ async def _scrape(
             columns=columns
         )
 
+    # Ensure virtual display.
+    start_virtual_display()
+
+    # Ensure browser.
+    ensure_playwright_browser()
+
     async with async_playwright() as playwright:
 
         browser = await create_browser(
@@ -1162,9 +1554,6 @@ async def _scrape(
                 MAX_CONCURRENCY
             )
 
-            # IMPORTANT:
-            # Same browser + same context.
-            # Pages are opened concurrently.
             tasks = [
                 scrape_one(
                     context,
@@ -1214,7 +1603,7 @@ async def _scrape(
 
 
 # ============================================================
-# PUBLIC SCRAPER FUNCTION
+# PUBLIC SCRAPER
 # ============================================================
 
 def scrape_funds(
@@ -1231,44 +1620,13 @@ def scrape_funds(
             "mode must be Lumpsum or SIP"
         )
 
-    try:
-
-        return asyncio.run(
-            _scrape(
-                selected_funds,
-                mode
-            )
+    # Streamlit runs this synchronously.
+    return asyncio.run(
+        _scrape(
+            selected_funds,
+            mode
         )
-
-    except RuntimeError as e:
-
-        # Safety for environments where an event loop
-        # already exists.
-        if "asyncio.run()" not in str(e):
-            raise
-
-        loop = asyncio.new_event_loop()
-
-        try:
-
-            asyncio.set_event_loop(
-                loop
-            )
-
-            return loop.run_until_complete(
-                _scrape(
-                    selected_funds,
-                    mode
-                )
-            )
-
-        finally:
-
-            loop.close()
-
-            asyncio.set_event_loop(
-                None
-            )
+    )
 
 
 # ============================================================
@@ -1392,7 +1750,9 @@ if __name__ == "__main__":
         "Bandhan Small Cap Fund Regular Growth"
     ]
 
-    print("\n========== LUMPSUM ==========\n")
+    print(
+        "\n========== LUMPSUM ==========\n"
+    )
 
     lumpsum = scrape_funds(
         test_fund,
@@ -1405,7 +1765,9 @@ if __name__ == "__main__":
         )
     )
 
-    print("\n========== SIP ==========\n")
+    print(
+        "\n========== SIP ==========\n"
+    )
 
     sip = scrape_funds(
         test_fund,

@@ -1,28 +1,22 @@
 import os
+
 import streamlit as st
 
-from main import FUNDS, scrape_funds, save_to_excel
+from main import (
+    FUNDS,
+    scrape_funds,
+    save_to_excel,
+)
 
 
 # ============================================================
-# PAGE
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="Mutual Fund Scraper",
     page_icon="📊",
     layout="wide",
-)
-
-
-# ============================================================
-# TITLE
-# ============================================================
-
-st.title("📊 Mutual Fund Performance")
-
-st.caption(
-    "Moneycontrol performance data"
 )
 
 
@@ -38,17 +32,35 @@ if "result_mode" not in st.session_state:
 
 
 # ============================================================
+# TITLE
+# ============================================================
+
+st.title(
+    "📊 Mutual Fund Performance"
+)
+
+st.caption(
+    "Moneycontrol performance data"
+)
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 
 with st.sidebar:
 
-    st.header("Fund Selection")
+    st.header(
+        "Fund Selection"
+    )
 
     mode = st.radio(
         "Return Type",
-        ["Lumpsum", "SIP"],
-        horizontal=True
+        [
+            "Lumpsum",
+            "SIP",
+        ],
+        horizontal=True,
     )
 
     st.divider()
@@ -65,7 +77,7 @@ with st.sidebar:
 
         selected_funds = fund_names
 
-        st.info(
+        st.caption(
             f"{len(selected_funds)} fund(s) selected"
         )
 
@@ -73,7 +85,7 @@ with st.sidebar:
 
         selected_funds = st.multiselect(
             "Choose fund(s)",
-            fund_names
+            fund_names,
         )
 
         st.caption(
@@ -85,12 +97,12 @@ with st.sidebar:
     fetch = st.button(
         "🚀 Fetch Fund Data",
         type="primary",
-        use_container_width=True
+        use_container_width=True,
     )
 
     clear = st.button(
         "🗑️ Clear Results",
-        use_container_width=True
+        use_container_width=True,
     )
 
 
@@ -120,32 +132,29 @@ if fetch:
 
     else:
 
-        progress = st.empty()
-
-        progress.info(
+        with st.spinner(
             f"Fetching {mode} data for "
             f"{len(selected_funds)} fund(s)..."
-        )
+        ):
 
-        try:
+            try:
 
-            df = scrape_funds(
-                selected_funds,
-                mode
-            )
+                df = scrape_funds(
+                    selected_funds,
+                    mode,
+                )
 
-            st.session_state.results = df
-            st.session_state.result_mode = mode
+                st.session_state.results = df
+                st.session_state.result_mode = mode
 
-            progress.empty()
+            except Exception as e:
 
-        except Exception as e:
+                st.error(
+                    f"Scraping failed: {e}"
+                )
 
-            progress.empty()
-
-            st.error(
-                f"Scraping failed: {e}"
-            )
+                st.session_state.results = None
+                st.session_state.result_mode = None
 
 
 # ============================================================
@@ -158,9 +167,34 @@ result_mode = st.session_state.result_mode
 
 if df is not None:
 
-    st.success(
-        f"Fetched {len(df)} fund(s)."
+    # Determine whether anything was actually extracted.
+    numeric_columns = [
+        "AUM (₹ Cr.)",
+        "1Y (%)",
+        "2Y (%)",
+        "3Y (%)",
+        "5Y (%)",
+    ]
+
+    has_data = (
+        df[numeric_columns]
+        .notna()
+        .any()
+        .any()
     )
+
+    if has_data:
+
+        st.success(
+            f"Fetched {len(df)} fund(s)."
+        )
+
+    else:
+
+        st.error(
+            "Moneycontrol opened, but no fund data "
+            "was extracted. Please try again."
+        )
 
     st.subheader(
         f"{result_mode} Performance"
@@ -174,18 +208,18 @@ if df is not None:
     st.dataframe(
         display_df,
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
     )
 
-    # --------------------------------------------------------
-    # Excel
-    # --------------------------------------------------------
+    # ========================================================
+    # EXCEL
+    # ========================================================
 
     excel_path = "mutual_funds.xlsx"
 
     save_to_excel(
         df,
-        excel_path
+        excel_path,
     )
 
     with open(
@@ -201,7 +235,7 @@ if df is not None:
                 "application/vnd.openxmlformats-"
                 "officedocument.spreadsheetml.sheet"
             ),
-            use_container_width=True
+            use_container_width=True,
         )
 
 else:
