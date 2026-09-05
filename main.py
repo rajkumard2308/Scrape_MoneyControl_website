@@ -211,16 +211,29 @@ def has_all_returns(data: Dict[str, Optional[float]]) -> bool:
 # ============================================================
 
 async def create_browser(playwright):
+    """
+    Launch Debian's system Chromium headless shell.
+    This is used on Streamlit Community Cloud.
+    """
 
     browser = await playwright.chromium.launch(
         headless=True,
+        executable_path="/usr/bin/chromium-headless-shell",
         args=[
-            "--headless=new",
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--disable-blink-features=AutomationControlled",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-features=Translate,BackForwardCache",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-notifications",
+            "--disable-popup-blocking",
             "--window-size=1440,900",
         ],
     )
