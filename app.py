@@ -1,4 +1,5 @@
-import os
+import time
+from datetime import datetime
 
 import streamlit as st
 
@@ -19,90 +20,119 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+    <style>
+        .block-container {padding-top: 2rem;}
+        div[data-testid="stMetricValue"] {font-size: 1.6rem;}
+
+        /* Compact sidebar: less top padding, tighter gaps between
+           widgets, and slimmer dividers. */
+        section[data-testid="stSidebar"] .block-container {
+            padding-top: 1.5rem;
+        }
+        section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {
+            gap: 0.5rem;
+        }
+        section[data-testid="stSidebar"] hr {
+            margin: 0.4rem 0;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-if "results" not in st.session_state:
-    st.session_state.results = None
+defaults = {
+    "results": None,
+    "result_mode": None,
+    "fetch_seconds": None,
+    "fetched_at": None,
+}
 
-if "result_mode" not in st.session_state:
-    st.session_state.result_mode = None
-
-
-# ============================================================
-# TITLE
-# ============================================================
-
-st.title(
-    "📊 Mutual Fund Performance"
-)
-
-st.caption(
-    "Moneycontrol performance data"
-)
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # ============================================================
-# SIDEBAR
+# HEADER
+# ============================================================
+
+title_col, badge_col = st.columns([5, 1])
+
+with title_col:
+    st.title("📊 Mutual Fund Performance")
+    st.caption(
+        "Live Lumpsum & SIP annualised returns and AUM, "
+        "sourced from Moneycontrol."
+    )
+
+with badge_col:
+    if st.session_state.fetched_at:
+        st.metric(
+            "Last fetched",
+            st.session_state.fetched_at,
+        )
+
+st.divider()
+
+
+# ============================================================
+# SIDEBAR — CONTROLS
 # ============================================================
 
 with st.sidebar:
 
-    st.header(
-        "Fund Selection"
-    )
+    st.header("Fund Selection")
 
     mode = st.radio(
-        "Return Type",
-        [
-            "Lumpsum",
-            "SIP",
-        ],
+        "Return type",
+        ["Lumpsum", "SIP", "Both"],
         horizontal=True,
+        help=(
+            "Both fetches Lumpsum and SIP together from a single page "
+            "load per fund — faster than running them separately."
+        ),
     )
 
-    st.divider()
+    fund_names = list(FUNDS.keys())
 
-    select_all = st.checkbox(
-        "Select all funds"
-    )
-
-    fund_names = list(
-        FUNDS.keys()
-    )
+    select_all = st.checkbox("Select all funds")
 
     if select_all:
-
         selected_funds = fund_names
-
-        st.caption(
-            f"{len(selected_funds)} fund(s) selected"
-        )
-
     else:
-
         selected_funds = st.multiselect(
             "Choose fund(s)",
             fund_names,
+            placeholder="Search and select funds...",
         )
 
-        st.caption(
-            f"{len(selected_funds)} fund(s) selected"
-        )
-
-    st.divider()
+    st.caption(f"**{len(selected_funds)}** of {len(fund_names)} fund(s) selected")
 
     fetch = st.button(
         "🚀 Fetch Fund Data",
         type="primary",
         use_container_width=True,
+        disabled=len(selected_funds) == 0,
     )
 
     clear = st.button(
         "🗑️ Clear Results",
         use_container_width=True,
+        disabled=st.session_state.results is None,
+    )
+
+    st.divider()
+
+    st.caption(
+        "Data is scraped on demand and reflects Moneycontrol's most "
+        "recently published figures at fetch time — not real-time NAV."
     )
 
 
@@ -111,10 +141,10 @@ with st.sidebar:
 # ============================================================
 
 if clear:
-
     st.session_state.results = None
     st.session_state.result_mode = None
-
+    st.session_state.fetch_seconds = None
+    st.session_state.fetched_at = None
     st.rerun()
 
 
@@ -125,36 +155,40 @@ if clear:
 if fetch:
 
     if not selected_funds:
-
-        st.warning(
-            "Please select at least one fund."
-        )
+        st.warning("Please select at least one fund.")
 
     else:
 
         with st.spinner(
-            f"Fetching {mode} data for "
-            f"{len(selected_funds)} fund(s)..."
+            f"Fetching {mode} data for {len(selected_funds)} fund(s)... "
+            "this can take a little while for larger selections."
         ):
 
             try:
+                started = time.perf_counter()
 
                 df = scrape_funds(
                     selected_funds,
                     mode,
                 )
 
+                elapsed = time.perf_counter() - started
+
                 st.session_state.results = df
                 st.session_state.result_mode = mode
+                st.session_state.fetch_seconds = elapsed
+                st.session_state.fetched_at = datetime.now().strftime(
+                    "%d %b, %H:%M"
+                )
 
             except Exception as e:
 
-                st.error(
-                    f"Scraping failed: {e}"
-                )
+                st.error(f"Scraping failed: {e}")
 
                 st.session_state.results = None
                 st.session_state.result_mode = None
+                st.session_state.fetch_seconds = None
+                st.session_state.fetched_at = None
 
 
 # ============================================================
@@ -164,16 +198,14 @@ if fetch:
 df = st.session_state.results
 result_mode = st.session_state.result_mode
 
-
 if df is not None:
 
-    # Determine whether anything was actually extracted.
+    # Numeric columns are derived from whatever the DataFrame actually
+    # has, since "Both" mode returns a different set of columns
+    # (Lumpsum + SIP side by side) than "Lumpsum" or "SIP" alone.
     numeric_columns = [
-        "AUM (₹ Cr.)",
-        "1Y (%)",
-        "2Y (%)",
-        "3Y (%)",
-        "5Y (%)",
+        column for column in df.columns
+        if column not in ("Fund", "Source")
     ]
 
     has_data = (
@@ -183,51 +215,90 @@ if df is not None:
         .any()
     )
 
+    funds_with_data = int(
+        df[numeric_columns].notna().any(axis=1).sum()
+    )
+
+    # ------------------------------------------------------
+    # Summary row
+    # ------------------------------------------------------
+
+    metric_cols = st.columns(4)
+
+    metric_cols[0].metric("Funds requested", len(df))
+    metric_cols[1].metric("Funds with data", funds_with_data)
+    metric_cols[2].metric(
+        "Success rate",
+        f"{(funds_with_data / len(df) * 100) if len(df) else 0:.0f}%",
+    )
+
+    if st.session_state.fetch_seconds is not None:
+        metric_cols[3].metric(
+            "Fetch time",
+            f"{st.session_state.fetch_seconds:.1f}s",
+        )
+
     if has_data:
-
-        st.success(
-            f"Fetched {len(df)} fund(s)."
-        )
-
+        if funds_with_data < len(df):
+            st.warning(
+                f"{len(df) - funds_with_data} fund(s) returned no data. "
+                "Moneycontrol may be slow to respond for those — try "
+                "fetching them again."
+            )
+        else:
+            st.success(f"Successfully fetched {len(df)} fund(s).")
     else:
-
         st.error(
-            "Moneycontrol opened, but no fund data "
-            "was extracted. Please try again."
+            "Moneycontrol opened, but no fund data was extracted. "
+            "Please try again."
         )
 
-    st.subheader(
-        f"{result_mode} Performance"
-    )
+    st.divider()
 
-    display_df = df.drop(
-        columns=["Source"],
-        errors="ignore"
-    )
+    st.subheader(f"{result_mode} Performance")
+
+    display_df = df.drop(columns=["Source"], errors="ignore")
+
+    # Format numbers nicely: AUM as ₹ Cr, everything else as %.
+    column_config = {}
+
+    if "AUM (₹ Cr.)" in display_df.columns:
+        column_config["AUM (₹ Cr.)"] = st.column_config.NumberColumn(
+            "AUM (₹ Cr.)",
+            format="₹%,.0f",
+        )
+
+    for column in display_df.columns:
+        if column.endswith("(%)"):
+            column_config[column] = st.column_config.NumberColumn(
+                column,
+                format="%.2f",
+            )
+
+    if "Fund" in display_df.columns:
+        column_config["Fund"] = st.column_config.TextColumn(
+            "Fund",
+            width="large",
+        )
 
     st.dataframe(
         display_df,
         use_container_width=True,
         hide_index=True,
+        column_config=column_config,
     )
 
     # ========================================================
-    # EXCEL
+    # DOWNLOADS
     # ========================================================
 
     excel_path = "mutual_funds.xlsx"
+    save_to_excel(df, excel_path)
 
-    save_to_excel(
-        df,
-        excel_path,
-    )
+    download_cols = st.columns(2)
 
-    with open(
-        excel_path,
-        "rb"
-    ) as file:
-
-        st.download_button(
+    with open(excel_path, "rb") as file:
+        download_cols[0].download_button(
             "📥 Download Excel",
             data=file,
             file_name="mutual_funds.xlsx",
@@ -238,9 +309,17 @@ if df is not None:
             use_container_width=True,
         )
 
+    download_cols[1].download_button(
+        "📄 Download CSV",
+        data=display_df.to_csv(index=False).encode("utf-8"),
+        file_name="mutual_funds.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
 else:
 
     st.info(
-        "Select fund(s), choose Lumpsum or SIP, "
-        "and click Fetch Fund Data."
+        "Select fund(s) in the sidebar, choose Lumpsum, SIP, or Both, "
+        "then click **Fetch Fund Data**."
     )
