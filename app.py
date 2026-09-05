@@ -1,6 +1,4 @@
 import os
-import tempfile
-
 import streamlit as st
 
 from main import FUNDS, scrape_funds, save_to_excel
@@ -18,122 +16,94 @@ st.set_page_config(
 
 
 # ============================================================
+# TITLE
+# ============================================================
+
+st.title("📊 Mutual Fund Performance")
+
+st.caption(
+    "Moneycontrol performance data"
+)
+
+
+# ============================================================
 # SESSION STATE
 # ============================================================
 
-if "fund_data" not in st.session_state:
-    st.session_state.fund_data = None
+if "results" not in st.session_state:
+    st.session_state.results = None
 
-if "selected_funds" not in st.session_state:
-    st.session_state.selected_funds = []
-
-if "return_type" not in st.session_state:
-    st.session_state.return_type = "Lumpsum"
-
-
-def clear_results():
-    st.session_state.fund_data = None
-    st.session_state.selected_funds = []
+if "result_mode" not in st.session_state:
+    st.session_state.result_mode = None
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-names = list(FUNDS.keys())
-
 with st.sidebar:
 
-    st.title("📊 Mutual Fund Scraper")
-
-    st.caption(
-        "Moneycontrol performance data"
-    )
-
-    st.divider()
-
-    st.subheader(
-        "Fund Selection"
-    )
+    st.header("Fund Selection")
 
     mode = st.radio(
         "Return Type",
         ["Lumpsum", "SIP"],
-        horizontal=True,
-        key="return_type",
-    )
-
-    all_funds = st.checkbox(
-        "Select all funds"
-    )
-
-    previous = [
-        fund
-        for fund in st.session_state.selected_funds
-        if fund in names
-    ]
-
-    selected = st.multiselect(
-        "Choose fund(s)",
-        names,
-        default=(
-            names
-            if all_funds
-            else previous
-        ),
-    )
-
-    st.session_state.selected_funds = selected
-
-    st.caption(
-        f"{len(selected)} fund(s) selected"
-    )
-
-    fetch = st.button(
-        "🚀 Fetch Fund Data",
-        type="primary",
-        use_container_width=True,
-    )
-
-    st.button(
-        "🗑️ Clear Results",
-        use_container_width=True,
-        on_click=clear_results,
+        horizontal=True
     )
 
     st.divider()
 
-    st.write(
-        "Data collected"
+    select_all = st.checkbox(
+        "Select all funds"
     )
 
-    st.write("• Fund Name")
-    st.write("• AUM")
-    st.write(
-        f"• {mode} Annualised Return — 1Y"
+    fund_names = list(
+        FUNDS.keys()
     )
-    st.write(
-        f"• {mode} Annualised Return — 2Y"
+
+    if select_all:
+
+        selected_funds = fund_names
+
+        st.info(
+            f"{len(selected_funds)} fund(s) selected"
+        )
+
+    else:
+
+        selected_funds = st.multiselect(
+            "Choose fund(s)",
+            fund_names
+        )
+
+        st.caption(
+            f"{len(selected_funds)} fund(s) selected"
+        )
+
+    st.divider()
+
+    fetch = st.button(
+        "🚀 Fetch Fund Data",
+        type="primary",
+        use_container_width=True
     )
-    st.write(
-        f"• {mode} Annualised Return — 3Y"
-    )
-    st.write(
-        f"• {mode} Annualised Return — 5Y"
+
+    clear = st.button(
+        "🗑️ Clear Results",
+        use_container_width=True
     )
 
 
 # ============================================================
-# MAIN
+# CLEAR
 # ============================================================
 
-st.title(
-    "📊 Mutual Fund Performance"
-)
+if clear:
 
-st.caption(
-    f"{mode} annualised returns with AUM."
-)
+    st.session_state.results = None
+    st.session_state.result_mode = None
+
+    st.rerun()
 
 
 # ============================================================
@@ -142,37 +112,32 @@ st.caption(
 
 if fetch:
 
-    if not selected:
+    if not selected_funds:
 
         st.warning(
-            "Please select at least one mutual fund."
+            "Please select at least one fund."
         )
 
     else:
 
         progress = st.empty()
 
+        progress.info(
+            f"Fetching {mode} data for "
+            f"{len(selected_funds)} fund(s)..."
+        )
+
         try:
 
-            progress.info(
-                f"Fetching {len(selected)} fund(s) "
-                f"— {mode}..."
+            df = scrape_funds(
+                selected_funds,
+                mode
             )
 
-            with st.spinner(
-                f"Fetching {mode} data from Moneycontrol..."
-            ):
+            st.session_state.results = df
+            st.session_state.result_mode = mode
 
-                result = scrape_funds(
-                    selected,
-                    mode
-                )
-
-            st.session_state.fund_data = result
-
-            progress.success(
-                f"Fetched {len(selected)} fund(s)."
-            )
+            progress.empty()
 
         except Exception as e:
 
@@ -184,91 +149,64 @@ if fetch:
 
 
 # ============================================================
-# RESULT
+# RESULTS
 # ============================================================
 
-df = st.session_state.fund_data
+df = st.session_state.results
+result_mode = st.session_state.result_mode
 
 
-if df is None or df.empty:
+if df is not None:
+
+    st.success(
+        f"Fetched {len(df)} fund(s)."
+    )
+
+    st.subheader(
+        f"{result_mode} Performance"
+    )
+
+    display_df = df.drop(
+        columns=["Source"],
+        errors="ignore"
+    )
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # --------------------------------------------------------
+    # Excel
+    # --------------------------------------------------------
+
+    excel_path = "mutual_funds.xlsx"
+
+    save_to_excel(
+        df,
+        excel_path
+    )
+
+    with open(
+        excel_path,
+        "rb"
+    ) as file:
+
+        st.download_button(
+            "📥 Download Excel",
+            data=file,
+            file_name="mutual_funds.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            ),
+            use_container_width=True
+        )
+
+else:
 
     st.info(
         "Select fund(s), choose Lumpsum or SIP, "
         "and click Fetch Fund Data."
     )
-
-else:
-
-    st.subheader(
-        f"{mode} Performance"
-    )
-
-    display = df[
-        [
-            "Fund",
-            "AUM (₹ Cr.)",
-            "1Y (%)",
-            "2Y (%)",
-            "3Y (%)",
-            "5Y (%)",
-        ]
-    ].copy()
-
-    st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    # ========================================================
-    # EXCEL
-    # ========================================================
-
-    tmp = None
-
-    try:
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".xlsx",
-            delete=False
-        ) as file:
-
-            tmp = file.name
-
-        save_to_excel(
-            display,
-            tmp
-        )
-
-        with open(
-            tmp,
-            "rb"
-        ) as file:
-
-            excel_data = file.read()
-
-        st.download_button(
-            "📥 Download Excel",
-            data=excel_data,
-            file_name=(
-                f"mutual_funds_"
-                f"{mode.lower()}.xlsx"
-            ),
-            mime=(
-                "application/vnd.openxmlformats-"
-                "officedocument.spreadsheetml.sheet"
-            ),
-            use_container_width=True,
-        )
-
-    finally:
-
-        if (
-            tmp
-            and os.path.exists(tmp)
-        ):
-
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
