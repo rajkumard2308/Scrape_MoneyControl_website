@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -23,15 +24,14 @@ from playwright.async_api import (
 
 OUTPUT_FILE = "mutual_funds.xlsx"
 
-# IMPORTANT (FIX):
-# The previous version set HEADLESS = True but the browser launch call
-# hardcoded headless=False and relied on Xvfb being available. On
-# Streamlit Community Cloud, Xvfb is usually NOT installed (it needs to
-# be added via packages.txt), so headed mode either fails to launch or
-# behaves unpredictably -- which is what caused inconsistent / wrong
-# Lumpsum & SIP values. True headless Chromium is faster, uses far less
-# memory (important on Cloud's limited CPU/RAM), and is what actually
-# gets used now.
+# IMPORTANT:
+# HEADLESS = True runs Chromium's modern "--headless=new" mode: no
+# visible window (works fine on a server/Streamlit Cloud with no
+# display, no Xvfb needed), but renders essentially identically to a
+# real headed browser. Classic/old headless mode was tried first and
+# confirmed to make Moneycontrol's Performance section behave
+# differently (no data at all), which is why this isn't just
+# headless=True passed straight to Playwright -- see create_browser().
 HEADLESS = True
 
 # Moneycontrol + Streamlit Cloud
@@ -443,12 +443,24 @@ async def create_browser(playwright):
         "--disable-blink-features=AutomationControlled",
     ]
 
-    # FIX: actually respect the HEADLESS setting instead of hardcoding
-    # headless=False. Headed mode on Streamlit Cloud only works if Xvfb
-    # is installed via packages.txt; when it isn't, launches fail or
-    # behave unpredictably, which is what produced bad Lumpsum/SIP data.
+    # FIX: Chromium's classic --headless mode has a different
+    # rendering/fingerprint profile than a real headed browser, and
+    # Moneycontrol's Performance section appears to behave differently
+    # under it -- this matches exactly what you saw (HEADLESS=True
+    # fetched nothing, HEADLESS=False worked).
+    #
+    # Chromium also has a newer "--headless=new" mode that renders
+    # essentially identically to headed Chromium while still running
+    # with no visible window (so it still works on a server/Streamlit
+    # Cloud with no display, no Xvfb needed). We get that by passing
+    # headless=False to Playwright itself (so it doesn't inject its
+    # own classic --headless flag) and adding --headless=new to args
+    # ourselves instead.
+    if HEADLESS:
+        args = args + ["--headless=new"]
+
     browser = await playwright.chromium.launch(
-        headless=HEADLESS,
+        headless=False,
         args=args,
     )
 
@@ -728,34 +740,35 @@ async def click_sip(page):
 
     clicked = False
 
-    # Primary: JS-native click on the custom-radio span. The trailing
-    # hash in the class name (__BpFF7) is a CSS module build hash and
-    # can change on redeploy, so match by prefix.
+    # Primary: your confirmed XPath for the SIP label itself.
     try:
-        sip_span = page.locator(
-            '#performance span[class*="Performance_web_customRadio"]'
-        ).nth(1)  # 0-indexed: Lumpsum=0, SIP=1, Quarterly=2, Best&Worst=3
+        sip_control = page.locator(
+            'xpath=//*[@id="performance"]/div/div[2]/div/label[2]'
+        ).first
 
-        if await sip_span.count() > 0:
-            await sip_span.evaluate("el => el.click()")
+        if await sip_control.count() > 0:
+            await sip_control.evaluate("el => el.click()")
             clicked = True
 
     except Exception as e:
-        print(f"WARNING: SIP span JS-click failed: {e}")
+        print(f"WARNING: SIP xpath JS-click failed: {e}")
 
     if not clicked:
-        # Fallback: JS-native click on the whole label.
+        # Fallback: JS-native click directly on the custom-radio span
+        # inside that label. The trailing hash in the class name
+        # (__BpFF7) is a CSS module build hash and can change on
+        # redeploy, so match by prefix.
         try:
-            sip_control = page.locator(
-                'xpath=//*[@id="performance"]/div/div[2]/div/label[2]'
-            ).first
+            sip_span = page.locator(
+                '#performance span[class*="Performance_web_customRadio"]'
+            ).nth(1)  # 0-indexed: Lumpsum=0, SIP=1, Quarterly=2, Best&Worst=3
 
-            if await sip_control.count() > 0:
-                await sip_control.evaluate("el => el.click()")
+            if await sip_span.count() > 0:
+                await sip_span.evaluate("el => el.click()")
                 clicked = True
 
         except Exception as e:
-            print(f"WARNING: SIP label JS-click failed: {e}")
+            print(f"WARNING: SIP span JS-click failed: {e}")
 
     if not clicked:
         # Last resort: a real simulated mouse click via Playwright.
@@ -774,53 +787,57 @@ async def click_sip(page):
         print("WARNING: Could not click the SIP control at all")
         return False
 
-    # Verify the table actually switched, using the real <h2> title
-    # text ("SIP Returns" vs "Absolute and Annualised Returns") rather
-    # than guessing from body text.
+    # Verify the table ACTUALLY switched by polling its real headers --
+    # the exact same check extract_sip() itself uses (table_mode_matches)
+    # -- rather than the <h2> title text. Logs confirmed a real race:
+    # the title updates to "SIP Returns" before the <table> body has
+    # re-rendered with SIP's columns (Invested/Latest/Start Date), so
+    # the old title-only check reported success too early and
+    # extract_sip() then read a table that didn't match SIP's shape.
+    deadline = time.monotonic() + (DATA_TIMEOUT / 1000)
+
+    while time.monotonic() < deadline:
+
+        try:
+            tables = performance.locator("table")
+            count = await tables.count()
+
+            for i in range(count):
+                rows = await read_table(tables.nth(i))
+
+                if table_mode_matches(rows, "SIP"):
+                    return True
+
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(250)
+
     try:
-        await page.wait_for_function(
-            r"""
-            () => {
-                const el = document.querySelector("#performance");
-                if (!el) return false;
+        snippet = await performance.inner_text(timeout=2000)
+        snippet = re.sub(r"\s+", " ", snippet)[:300]
+    except Exception:
+        snippet = "<unavailable>"
 
-                const titles = Array.from(
-                    el.querySelectorAll('[class*="Performance_web_tableTitle"]')
-                ).map(n => (n.innerText || "").trim().toLowerCase());
+    # Dump the actual HTML of the toggle group so a persistent
+    # failure can be diagnosed from real evidence instead of
+    # another guess -- this will show any real <input> element,
+    # onClick wiring, or structural difference we haven't seen yet.
+    try:
+        toggle_html = await page.locator(
+            'xpath=//*[@id="performance"]/div/div[2]/div'
+        ).first.evaluate("el => el.outerHTML")
+        toggle_html = toggle_html[:1500]
+    except Exception:
+        toggle_html = "<unavailable>"
 
-                return titles.some(t => t.includes("sip returns"));
-            }
-            """,
-            timeout=DATA_TIMEOUT,
-        )
-
-        return True
-
-    except Exception as e:
-        try:
-            snippet = await performance.inner_text(timeout=2000)
-            snippet = re.sub(r"\s+", " ", snippet)[:300]
-        except Exception:
-            snippet = "<unavailable>"
-
-        # Dump the actual HTML of the toggle group so a persistent
-        # failure can be diagnosed from real evidence instead of
-        # another guess -- this will show any real <input> element,
-        # onClick wiring, or structural difference we haven't seen yet.
-        try:
-            toggle_html = await page.locator(
-                'xpath=//*[@id="performance"]/div/div[2]/div'
-            ).first.evaluate("el => el.outerHTML")
-            toggle_html = toggle_html[:1500]
-        except Exception:
-            toggle_html = "<unavailable>"
-
-        print(
-            f"WARNING: SIP table title never showed 'SIP Returns': {e} | "
-            f"performance section snippet: {snippet!r} | "
-            f"toggle group HTML: {toggle_html!r}"
-        )
-        return False
+    print(
+        f"WARNING: SIP table never matched the expected header "
+        f"structure within {DATA_TIMEOUT}ms | "
+        f"performance section snippet: {snippet!r} | "
+        f"toggle group HTML: {toggle_html!r}"
+    )
+    return False
 
 # ============================================================
 # TABLE READER

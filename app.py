@@ -92,12 +92,8 @@ with st.sidebar:
 
     mode = st.radio(
         "Return type",
-        ["Lumpsum", "SIP", "Both"],
+        ["Lumpsum", "SIP"],
         horizontal=True,
-        help=(
-            "Both fetches Lumpsum and SIP together from a single page "
-            "load per fund — faster than running them separately."
-        ),
     )
 
     fund_names = list(FUNDS.keys())
