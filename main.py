@@ -978,25 +978,29 @@ async def parse_table(table, mode):
 
     return result
 
-# ============================================================
-# LUMPSUM
-# ============================================================
 
-
-async def extract_lumpsum(page, performance):
+async def poll_for_returns(page, performance, mode, timeout_ms):
     """
-    Extract Lumpsum Annualised(%) values for 1Y/2Y/3Y/5Y only.
+    Poll #performance's tables until one matches `mode`'s header shape
+    (table_mode_matches) AND has at least one real (non-None)
+    Annualised value, or until timeout_ms elapses.
 
-    This is the default view of #performance -- no click needed.
-    Polls the actual table headers (same table_mode_matches() check
-    used everywhere else) until they match Lumpsum's shape, instead of
-    checking once. A single check was fine on a fast local machine but
-    lost the render race on Streamlit Cloud's slower shared CPU, which
-    is exactly the same class of bug click_sip() had for SIP.
+    Why this exists: the table's headers/columns render before its
+    actual data cells populate (a separate, slightly-later data fetch
+    fills in the numbers). A one-shot check right after the headers
+    appear can "succeed" structurally while every cell is still blank
+    -- exactly what happened on Streamlit Cloud's slower rendering
+    (fast locally, so the race was rarely lost there).
+
+    Some funds are genuinely blank for some periods (e.g. a fund
+    younger than 5 years has no real 5Y return), so running out of
+    time isn't necessarily a real failure -- we keep the best
+    (structurally-matching) result we saw and return that if we never
+    see a non-blank value before the deadline.
     """
-    result = empty_returns()
-
-    deadline = time.monotonic() + (DATA_TIMEOUT / 1000)
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    last_result = empty_returns()
+    found_structural_match = False
 
     while time.monotonic() < deadline:
 
@@ -1008,31 +1012,56 @@ async def extract_lumpsum(page, performance):
                 table = tables.nth(i)
                 rows = await read_table(table)
 
-                if not table_mode_matches(rows, "Lumpsum"):
+                if not table_mode_matches(rows, mode):
                     continue
 
-                parsed = await parse_table(table, "Lumpsum")
+                found_structural_match = True
 
-                for key in PERIODS:
-                    # Only copy the exact Annualised value. None stays
-                    # None.
-                    result[key] = parsed[key]
+                parsed = await parse_table(table, mode)
+                last_result = parsed
 
-                # Return once the correct table has been found.
-                # We intentionally do NOT use another table as a
-                # fallback.
-                return result
+                if has_any_returns(parsed):
+                    return parsed
+
+                # Matched the right table this round, but every period
+                # is still blank -- could be mid-load. Keep polling
+                # rather than accepting it immediately.
+                break
 
         except Exception as e:
-            print(f"WARNING: Lumpsum table read attempt failed: {e}")
+            print(f"WARNING: {mode} table read attempt failed: {e}")
 
         await page.wait_for_timeout(250)
 
-    print(
-        f"WARNING: Correct Lumpsum performance table not found within "
-        f"{DATA_TIMEOUT}ms"
-    )
-    return result
+    if found_structural_match:
+        print(
+            f"WARNING: {mode} table matched but every period stayed "
+            f"blank within {timeout_ms}ms -- returning as-is (may be "
+            f"genuinely blank for this fund)"
+        )
+    else:
+        print(
+            f"WARNING: Correct {mode} performance table not found "
+            f"within {timeout_ms}ms"
+        )
+
+    return last_result
+
+
+# ============================================================
+# LUMPSUM
+# ============================================================
+
+
+async def extract_lumpsum(page, performance):
+    """
+    Extract Lumpsum Annualised(%) values for 1Y/2Y/3Y/5Y only.
+
+    This is the default view of #performance -- no click needed. Uses
+    poll_for_returns() to wait for real data, not just the right
+    table headers (see that function's docstring for why).
+    """
+    return await poll_for_returns(page, performance, "Lumpsum", DATA_TIMEOUT)
 
 
 
@@ -1040,46 +1069,21 @@ async def extract_sip(page, performance):
     """
     Extract SIP Annualised(%) values for 1Y/2Y/3Y/5Y only.
 
-    The SIP table has a different layout from Lumpsum, so this function
-    first switches to SIP (see click_sip()) and verifies the real "SIP
-    Returns" table title before reading -- no "Performance" tab click
-    is needed beforehand; #performance is already present on the page
-    with Lumpsum showing by default.
+    click_sip() confirms the click actually switched the table
+    structurally (cheap, structure-only check). Once that's confirmed,
+    poll_for_returns() takes over to wait for real data in that table,
+    not just the right headers (see that function's docstring for why
+    that distinction matters) -- no "Performance" tab click is needed
+    beforehand; #performance is already present on the page with
+    Lumpsum showing by default.
     """
-    result = empty_returns()
-
     clicked = await click_sip(page)
 
     if not clicked:
         print("WARNING: SIP mode could not be verified")
-        return result
+        return empty_returns()
 
-    tables = performance.locator("table")
-    count = await tables.count()
-
-    for i in range(count):
-        try:
-            table = tables.nth(i)
-            rows = await read_table(table)
-
-            if not table_mode_matches(rows, "SIP"):
-                continue
-
-            parsed = await parse_table(table, "SIP")
-
-            for key in PERIODS:
-                # Only copy the exact Annualised value. None stays None.
-                result[key] = parsed[key]
-
-            # Correct SIP table found. Never fall back to Lumpsum/text.
-            return result
-
-        except Exception as e:
-            print(f"WARNING: SIP table {i} parse failed: {e}")
-            continue
-
-    print("WARNING: Correct SIP performance table not found")
-    return result
+    return await poll_for_returns(page, performance, "SIP", DATA_TIMEOUT)
 
 
 # ============================================================
