@@ -38,7 +38,7 @@ HEADLESS = True
 MAX_CONCURRENCY = 6
 
 PAGE_TIMEOUT = 30000
-DATA_TIMEOUT = 10000
+DATA_TIMEOUT = 15000
 ELEMENT_TIMEOUT = 7000
 
 MAX_RETRIES = 2
@@ -987,60 +987,51 @@ async def extract_lumpsum(page, performance):
     """
     Extract Lumpsum Annualised(%) values for 1Y/2Y/3Y/5Y only.
 
-    This is the default view of #performance -- no click needed. It
-    just waits for the "Absolute and Annualised Returns" table to be
-    ready, then reads it.
+    This is the default view of #performance -- no click needed.
+    Polls the actual table headers (same table_mode_matches() check
+    used everywhere else) until they match Lumpsum's shape, instead of
+    checking once. A single check was fine on a fast local machine but
+    lost the render race on Streamlit Cloud's slower shared CPU, which
+    is exactly the same class of bug click_sip() had for SIP.
     """
     result = empty_returns()
 
-    try:
-        await page.wait_for_function(
-            r"""
-            () => {
-                const el = document.querySelector("#performance");
-                if (!el) return false;
+    deadline = time.monotonic() + (DATA_TIMEOUT / 1000)
 
-                const text = (el.innerText || "")
-                    .replace(/\s+/g, " ")
-                    .toLowerCase();
+    while time.monotonic() < deadline:
 
-                return (
-                    text.includes("absolute and annualised returns") ||
-                    text.includes("absolute and annualized returns")
-                );
-            }
-            """,
-            timeout=DATA_TIMEOUT,
-        )
-    except Exception:
-        pass
-
-    tables = performance.locator("table")
-    count = await tables.count()
-
-    for i in range(count):
         try:
-            table = tables.nth(i)
-            rows = await read_table(table)
+            tables = performance.locator("table")
+            count = await tables.count()
 
-            if not table_mode_matches(rows, "Lumpsum"):
-                continue
+            for i in range(count):
+                table = tables.nth(i)
+                rows = await read_table(table)
 
-            parsed = await parse_table(table, "Lumpsum")
+                if not table_mode_matches(rows, "Lumpsum"):
+                    continue
 
-            for key in PERIODS:
-                # Only copy the exact Annualised value. None stays None.
-                result[key] = parsed[key]
+                parsed = await parse_table(table, "Lumpsum")
 
-            # Return once the correct table has been found.
-            # We intentionally do NOT use another table as a fallback.
-            return result
+                for key in PERIODS:
+                    # Only copy the exact Annualised value. None stays
+                    # None.
+                    result[key] = parsed[key]
+
+                # Return once the correct table has been found.
+                # We intentionally do NOT use another table as a
+                # fallback.
+                return result
 
         except Exception as e:
-            print(f"WARNING: Lumpsum table {i} parse failed: {e}")
-            continue
+            print(f"WARNING: Lumpsum table read attempt failed: {e}")
 
-    print("WARNING: Correct Lumpsum performance table not found")
+        await page.wait_for_timeout(250)
+
+    print(
+        f"WARNING: Correct Lumpsum performance table not found within "
+        f"{DATA_TIMEOUT}ms"
+    )
     return result
 
 
