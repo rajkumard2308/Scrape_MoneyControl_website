@@ -104,12 +104,12 @@ with st.sidebar:
         selected_funds = fund_names
     else:
         selected_funds = st.multiselect(
-            "Choose fund(s)",
+            "Choose funds",
             fund_names,
             placeholder="Search and select funds...",
         )
 
-    st.caption(f"**{len(selected_funds)}** of {len(fund_names)} fund(s) selected")
+    st.caption(f"**{len(selected_funds)}** of {len(fund_names)} funds selected")
 
     fetch = st.button(
         "🚀 Fetch Fund Data",
@@ -156,7 +156,7 @@ if fetch:
     else:
 
         with st.spinner(
-            f"Fetching {mode} data for {len(selected_funds)} fund(s)... "
+            f"Fetching {mode} data for {len(selected_funds)} funds... "
             "this can take a little while for larger selections."
         ):
 
@@ -237,12 +237,12 @@ if df is not None:
     if has_data:
         if funds_with_data < len(df):
             st.warning(
-                f"{len(df) - funds_with_data} fund(s) returned no data. "
+                f"{len(df) - funds_with_data} funds returned no data. "
                 "Moneycontrol may be slow to respond for those — try "
                 "fetching them again."
             )
         else:
-            st.success(f"Successfully fetched {len(df)} fund(s).")
+            st.success(f"Successfully fetched {len(df)} funds.")
     else:
         st.error(
             "Moneycontrol opened, but no fund data was extracted. "
@@ -316,6 +316,6 @@ if df is not None:
 else:
 
     st.info(
-        "Select fund(s) in the sidebar, choose Lumpsum, SIP, or Both, "
+        "Select funds in the sidebar, choose Lumpsum or SIP"
         "then click **Fetch Fund Data**."
     )
