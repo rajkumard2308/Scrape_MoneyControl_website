@@ -316,6 +316,6 @@ if df is not None:
 else:
 
     st.info(
-        "Select funds in the sidebar, choose Lumpsum or SIP"
+        "Select funds in the sidebar, choose Lumpsum or SIP, "
         "then click **Fetch Fund Data**."
     )
