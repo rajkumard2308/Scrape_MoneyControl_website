@@ -53,6 +53,13 @@ FUNDS = {
         "url": "https://www.moneycontrol.com/mutual-funds/nav/bandhan-small-cap-fund-regular-plan-growth/MAG2106"
     },
 
+    "Kotak Multi Cap Fund Regular Growth": {
+        "url": "https://www.moneycontrol.com/mutual-funds/nav/kotak-multicap-fund-regular-plan/MKM1397"
+    },
+
+    "Nippon India Multi Asset Allocation Fund Regular Growth": {
+        "url": "https://www.moneycontrol.com/mutual-funds/nav/nippon-india-multi-asset-fund-regular-plan/MRC2856"
+    },
     "Bandhan Large & Mid Cap Fund - Growth": {
         "url": "https://www.moneycontrol.com/mutual-funds/nav/bandhan-large-mid-cap-fund-regular-plan-growth/MAG091"
     },
